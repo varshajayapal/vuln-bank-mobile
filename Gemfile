@@ -14,3 +14,6 @@ gem 'bigdecimal'
 gem 'logger'
 gem 'benchmark'
 gem 'mutex_m'
+
+# CI: unsigned IPA build (fastlane/Fastfile)
+gem "fastlane", "~> 2.241"

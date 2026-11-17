@@ -1,0 +1,153 @@
+# Generic unsigned-IPA build for CI security scanning (Appknox).
+#
+# Drop this into the root of any iOS repository. It finds the Xcode workspace or
+# project, installs CocoaPods if needed, makes sure a shared scheme exists, archives
+# a Release build without code signing and packages it as build/<App>.ipa.
+#
+# Optional overrides (environment variables):
+#   IOS_WORKSPACE      path to the .xcworkspace (relative to repo root)
+#   IOS_PROJECT        path to the .xcodeproj, when there is no workspace
+#   IOS_SCHEME         scheme to build (default: the first application target)
+#   IOS_CONFIGURATION  build configuration (default: Release)
+#   IOS_MIN_POD_TARGET minimum iOS version to force on Pods targets (default: 12.0)
+
+require "fileutils"
+require "shellwords"
+require "tmpdir"
+
+default_platform(:ios)
+
+# Fastfile code runs from the fastlane/ directory; resolve paths from the repo root.
+REPO_ROOT = File.expand_path("..", __dir__)
+BUILD_DIR = File.join(REPO_ROOT, "build")
+ARCHIVE_PATH = File.join(BUILD_DIR, "App.xcarchive")
+IGNORED_DIRS = %w[Pods Carthage node_modules build DerivedData .build .git].freeze
+APP_PRODUCT_TYPE = "com.apple.product-type.application".freeze
+
+platform :ios do
+  desc "Build an unsigned IPA (for security scanning, not for distribution)"
+  lane :build_unsigned do
+    install_pods_if_needed
+    container = find_build_container
+    scheme = ENV["IOS_SCHEME"] || ensure_shared_scheme(container)
+    UI.message("Building #{container[:type]} #{container[:path]} with scheme '#{scheme}'")
+
+    build_app(
+      container[:type] => container[:path],
+      scheme: scheme,
+      configuration: ENV.fetch("IOS_CONFIGURATION", "Release"),
+      destination: "generic/platform=iOS",
+      archive_path: ARCHIVE_PATH,
+      derived_data_path: File.join(BUILD_DIR, "DerivedData"),
+      skip_codesigning: true,
+      skip_package_ipa: true,
+      clean: true,
+      xcargs: "-skipPackagePluginValidation -skipMacroValidation"
+    )
+
+    package_unsigned_ipa
+  end
+end
+
+def search(pattern)
+  Dir.glob(File.join(REPO_ROOT, "**", pattern))
+     .reject { |p| p.split(File::SEPARATOR).any? { |part| IGNORED_DIRS.include?(part) } }
+     .reject { |p| p.include?(".xcodeproj/") }
+     .sort_by { |p| [p.count(File::SEPARATOR), p] }
+end
+
+def podfile_path
+  @podfile_path ||= search("Podfile").first
+end
+
+def install_pods_if_needed
+  return unless podfile_path
+
+  pods_dir = File.join(File.dirname(podfile_path), "Pods")
+  lock = File.join(File.dirname(podfile_path), "Podfile.lock")
+  manifest = File.join(pods_dir, "Manifest.lock")
+  up_to_date = File.exist?(lock) && File.exist?(manifest) && FileUtils.compare_file(lock, manifest)
+
+  if up_to_date
+    UI.message("Pods are committed and match Podfile.lock; skipping pod install")
+  else
+    cocoapods(podfile: podfile_path, try_repo_update_on_error: true)
+  end
+  raise_pods_deployment_target(pods_dir)
+end
+
+# Old pods often target iOS 8-11. Xcode 14.3+ no longer ships libarclite for those
+# versions, so linking fails. Raise them to a supported minimum (CI checkout only).
+def raise_pods_deployment_target(pods_dir)
+  pbxproj = File.join(pods_dir, "Pods.xcodeproj", "project.pbxproj")
+  return unless File.exist?(pbxproj)
+
+  minimum = Gem::Version.new(ENV.fetch("IOS_MIN_POD_TARGET", "12.0"))
+  text = File.read(pbxproj)
+  patched = text.gsub(/IPHONEOS_DEPLOYMENT_TARGET = ([\d.]+);/) do
+    Gem::Version.new(Regexp.last_match(1)) < minimum ? "IPHONEOS_DEPLOYMENT_TARGET = #{minimum};" : Regexp.last_match(0)
+  end
+  File.write(pbxproj, patched) unless patched == text
+end
+
+def find_build_container
+  return { type: :workspace, path: File.join(REPO_ROOT, ENV["IOS_WORKSPACE"]) } if ENV["IOS_WORKSPACE"]
+  return { type: :project, path: File.join(REPO_ROOT, ENV["IOS_PROJECT"]) } if ENV["IOS_PROJECT"]
+
+  workspace = search("*.xcworkspace").first
+  return { type: :workspace, path: workspace } if workspace
+
+  project = search("*.xcodeproj").first
+  UI.user_error!("No .xcworkspace or .xcodeproj found under #{REPO_ROOT}") unless project
+  { type: :project, path: project }
+end
+
+def app_projects(container)
+  paths =
+    if container[:type] == :workspace
+      require "xcodeproj"
+      Xcodeproj::Workspace.new_from_xcworkspace(container[:path]).file_references
+                          .map { |ref| ref.absolute_path(File.dirname(container[:path])) }
+    else
+      [container[:path]]
+    end
+  paths.select { |p| p.end_with?(".xcodeproj") && File.basename(p) != "Pods.xcodeproj" && File.exist?(p) }
+end
+
+# CI machines only see shared schemes (xcshareddata). Reuse one named after an app
+# target, or create it from the first app target, without touching the user's schemes.
+def ensure_shared_scheme(container)
+  require "xcodeproj"
+  app_projects(container).each do |project_path|
+    project = Xcodeproj::Project.open(project_path)
+    target = project.native_targets.find { |t| t.product_type == APP_PRODUCT_TYPE }
+    next unless target
+
+    shared = File.join(project_path, "xcshareddata", "xcschemes", "#{target.name}.xcscheme")
+    unless File.exist?(shared)
+      UI.message("Creating shared scheme '#{target.name}' in #{File.basename(project_path)}")
+      scheme = Xcodeproj::XCScheme.new
+      scheme.configure_with_targets(target, nil, launch_target: true)
+      scheme.save_as(project_path, target.name, true)
+    end
+    return target.name
+  end
+  UI.user_error!("No iOS application target found; set IOS_SCHEME explicitly")
+end
+
+# An IPA is a zip with the .app inside a top-level Payload/ directory.
+def package_unsigned_ipa
+  app = Dir.glob(File.join(ARCHIVE_PATH, "Products", "Applications", "*.app")).first
+  UI.user_error!("No .app found in #{ARCHIVE_PATH}/Products/Applications") unless app
+
+  ipa = File.join(BUILD_DIR, "#{File.basename(app, '.app')}.ipa")
+  FileUtils.rm_f(ipa)
+  Dir.mktmpdir do |staging|
+    FileUtils.mkdir_p(File.join(staging, "Payload"))
+    FileUtils.cp_r(app, File.join(staging, "Payload"))
+    sh("cd #{staging.shellescape} && zip -qry #{ipa.shellescape} Payload")
+  end
+
+  File.open(ENV["GITHUB_ENV"], "a") { |f| f.puts("APP_PATH=#{ipa}") } if ENV["GITHUB_ENV"]
+  UI.success("Unsigned IPA: #{ipa}")
+end
